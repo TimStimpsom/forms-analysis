@@ -212,6 +212,15 @@ The controller coordinates authentication, schema selection, submission validati
 
 ```ruby
 class CompanyTasksController < ApplicationController
+  def edit
+    task = current_account.company_tasks.find(params[:id])
+
+    render json: {
+      schema: task.form_definition.schema,
+      data: SchemaFormSerializer.new(task).as_json
+    }
+  end
+
   def create
     definition = FormDefinition.find_by!(
       record_type: "CompanyTask",
@@ -237,10 +246,135 @@ class CompanyTasksController < ApplicationController
       render_record_errors(task)
     end
   end
+
+  private
+
+  def render_errors(errors)
+    render json: { errors: errors }, status: :unprocessable_entity
+  end
+
+  def render_record_errors(record)
+    errors = record.errors.map do |error|
+      {
+        field: error.attribute.to_s,
+        message: error.message
+      }
+    end
+
+    render_errors(errors)
+  end
 end
 ```
 
 The example uses to_unsafe_h because the submission is dynamic and is never passed into Active Record mass assignment. The selected JSON Schema must reject unexpected keys with additionalProperties set to false. A production implementation may instead derive a permitted parameter structure from the schema.
+
+#### Form submission validator
+
+The validator wraps the chosen JSON Schema library and normalises failures into the same field-level error shape used by model errors.
+
+```ruby
+class FormSubmissionValidator
+  def initialize(form_definition, submitted_data)
+    @form_definition = form_definition
+    @submitted_data = submitted_data
+  end
+
+  def errors
+    JSONSchemer
+      .schema(@form_definition.schema)
+      .validate(@submitted_data)
+      .map { |error| normalize_error(error) }
+  end
+
+  private
+
+  def normalize_error(error)
+    {
+      field: error.fetch("data_pointer").delete_prefix("/").tr("/", "."),
+      message: error.fetch("type").to_s.humanize
+    }
+  end
+end
+```
+
+The exact validator gem can vary. The important contract is that schema validation returns `[{ field:, message: }]` and runs before the writer assigns relational values.
+
+#### Reconstructing the form shape
+
+The serializer performs the reverse operation from the writer. It starts with the JSONB data document and adds relationship IDs back from columns or association foreign keys so the frontend receives a complete form payload for editing.
+
+```ruby
+class SchemaFormSerializer
+  def initialize(record)
+    @record = record
+  end
+
+  def as_json
+    (@record.data || {}).deep_dup.tap do |data|
+      relationship_mapping.each do |input_key, definition|
+        association = definition.fetch(:association)
+        data[input_key] = @record.public_send("#{association}_id")
+      end
+    end
+  end
+
+  private
+
+  def relationship_mapping
+    SchemaRecordWriter::RELATIONSHIPS.fetch(@record.class.name, {})
+  end
+end
+```
+
+For a company task stored as:
+
+```ruby
+company_task.company_goal_id = 10
+company_task.data = {
+  "title" => "Contact customers at risk",
+  "status" => "in_progress",
+  "due_date" => "2026-10-31"
+}
+```
+
+the edit response becomes:
+
+```json
+{
+  "schema": {
+    "...": "..."
+  },
+  "data": {
+    "title": "Contact customers at risk",
+    "status": "in_progress",
+    "due_date": "2026-10-31",
+    "company_goal_id": 10
+  }
+}
+```
+
+The frontend does not need to know that `company_goal_id` is stored outside JSONB. The API boundary reconstructs the full form-shaped document.
+
+#### API serializer
+
+The record serializer can use the same form serializer so create, show, and edit responses stay consistent.
+
+```ruby
+class CompanyTaskSerializer
+  def initialize(task)
+    @task = task
+  end
+
+  def serializable_hash
+    {
+      id: @task.id,
+      type: "CompanyTask",
+      form_definition_id: @task.form_definition_id,
+      data: SchemaFormSerializer.new(@task).as_json
+    }
+  end
+end
+```
 
 #### Error response
 
