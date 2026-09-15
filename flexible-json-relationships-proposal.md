@@ -434,3 +434,99 @@ The edge table preserves the main benefit of the flexible model while giving the
 Choose this design if relationship configurability is a core product requirement. Choose the hybrid design if the relationship model is mostly known in advance and the main flexibility need is adding ordinary form fields.
 
 The strongest practical version is not pure JSON-only. It is JSON as the source of truth plus a generic edge table as a maintained projection.
+
+## 18 Why Not Choose This By Default
+
+This design should not be the default implementation if CompanyGoal, CompanyTask, IndividualEmployeeTask, and Employee are known product concepts with mostly stable relationships. The flexibility is real, but it is bought by moving relationship behaviour out of Rails and the database and into custom application infrastructure.
+
+### It creates ORM-like responsibilities
+
+Putting relationships inside JSON means the application must implement behaviour that Rails associations normally provide:
+
+- Resolving relationship IDs into records.
+- Enforcing account scoping for every relationship.
+- Handling one-to-one, one-to-many, and many-to-many semantics.
+- Implementing reverse lookups.
+- Deciding restrict, nullify, soft delete, or cascade behaviour.
+- Preventing or repairing orphaned references.
+- Preloading linked records without N plus 1 queries.
+- Auditing relationship changes.
+- Keeping every controller, background job, import, and admin path consistent.
+
+This is not just a persistence change. It is a custom relationship engine.
+
+### Querying becomes harder as the product grows
+
+Saving JSON is straightforward. Operating on it later is the difficult part.
+
+Simple filters such as status or due date can be handled with JSONB expression indexes. More realistic product questions become more complex:
+
+- Which tasks belong to this goal?
+- Which tasks are assigned to this employee?
+- Which records point to this record through any relationship?
+- Can this goal, task, or employee be deleted safely?
+- Show overdue tasks grouped by goal, account, assignee, and status.
+- Report across several record types with different schemas.
+
+Without an edge table, these become JSONB path queries, array searches, expression indexes, GIN indexes, or full scans. With an edge table, querying improves, but relationship data now exists both in JSON and in a derived projection.
+
+### The edge table reduces one risk but introduces another
+
+The edge table is useful because it makes reverse lookup and delete checks practical:
+
+```text
+source_schema_record_id | relationship_key | target_schema_record_id
+25                      | company_goal     | 10
+```
+
+However, it also means the system stores relationship information twice:
+
+```text
+schema_records.data.relationships.company_goal.target_id = 10
+schema_record_edges.target_schema_record_id = 10
+```
+
+The intended source of truth is still JSON, but the projection can drift unless the application:
+
+- Rebuilds edges on every relationship write.
+- Updates JSON and edges in the same transaction.
+- Prevents direct edge edits.
+- Tests that JSON and edges match.
+- Provides an audit or repair job.
+- Defines what to do if JSON and edges disagree.
+
+That is a substantial consistency burden.
+
+### Cross-database relationships are especially risky
+
+If JSON records live in PostgreSQL and Employee lives in MySQL, the full JSON approach becomes a cross-database relationship system.
+
+PostgreSQL cannot enforce that a JSON `employee_id` exists in MySQL. It also cannot cascade deletes from MySQL, join directly to MySQL for reporting, or protect a write with a single database transaction across both systems.
+
+The hybrid model has the same cross-database limitation for Employee, but it keeps the relationship visible as an explicit `employee_id` column and can expose a Rails association. The all-JSON model hides the same external reference inside a flexible document, making it harder to query, audit, and debug.
+
+### It weakens the value of Rails conventions
+
+Rails associations give the team a shared vocabulary:
+
+```ruby
+company_task.company_goal
+individual_employee_task.employee
+company_goal.company_tasks
+```
+
+The all-JSON model replaces much of that with generic lookup code and schema interpretation. Future engineers need to understand both the schema system and the custom relationship engine before they can safely answer ordinary domain questions.
+
+### It should require a high bar
+
+Choose this design only if the product truly needs users or administrators to define new relationship types at runtime.
+
+Do not choose it only to avoid migrations. If the relationship model is known in advance, explicit columns plus Rails association syntax are simpler, easier to query, easier to test, and easier to operate.
+
+Recommended pushback:
+
+- Dynamic form fields belong in JSONB.
+- Known business relationships should remain explicit columns.
+- MySQL-backed Employee can still use Rails association syntax, with app-level validation.
+- JSON relationships should be reserved for relationship types that are genuinely user-configurable.
+- If an edge table becomes necessary, acknowledge that the system is recreating relational structure as a custom projection.
