@@ -345,18 +345,108 @@ The JSONB data and PostgreSQL relationship assignments should be saved in one Po
 
 #### Filtering and indexes
 
+Raw JSONB SQL should not be scattered through controllers, serializers, jobs, or report code. JSONB filtering should live behind a small allow-listed query layer, with domain scopes on the model and query objects for larger screens or reports.
+
+The intended calling code should look like ordinary Rails:
+
 ```ruby
-CompanyTask.where("data->>'status' = ?", "in_progress")
-CompanyTask.where(
-  "(data->>'due_date')::date <= ?",
-  Date.current
-)
+CompanyTask.in_progress
+CompanyTask.due_before(Date.current)
+CompanyTaskQuery.new(current_account.company_tasks)
+  .for_dashboard
+  .due_before(Date.current)
+```
+
+The model declares which JSONB fields are queryable:
+
+```ruby
+class CompanyTask < ApplicationRecord
+  include JsonbFilterable
+
+  jsonb_field :status, type: :string
+  jsonb_field :due_date, type: :date
+  jsonb_field :priority, type: :string
+
+  scope :in_progress, -> { where_jsonb(:status, "in_progress") }
+  scope :due_before, ->(date) { where_jsonb_date_lte(:due_date, date) }
+end
+```
+
+The shared concern owns the SQL fragments and only accepts allow-listed fields:
+
+```ruby
+module JsonbFilterable
+  extend ActiveSupport::Concern
+
+  class_methods do
+    def jsonb_field(name, type:)
+      jsonb_fields[name.to_sym] = type
+    end
+
+    def jsonb_fields
+      @jsonb_fields ||= {}
+    end
+
+    def where_jsonb(field, value)
+      ensure_jsonb_field!(field)
+      key = connection.quote_string(field.to_s)
+      where("data->>'#{key}' = ?", value)
+    end
+
+    def where_jsonb_date_lte(field, value)
+      ensure_jsonb_field!(field, expected_type: :date)
+      key = connection.quote_string(field.to_s)
+      where("(data->>'#{key}')::date <= ?", value)
+    end
+
+    private
+
+    def ensure_jsonb_field!(field, expected_type: nil)
+      type = jsonb_fields[field.to_sym]
+      raise ArgumentError, "Unknown JSONB field: #{field}" unless type
+      raise ArgumentError, "Expected #{expected_type}, got #{type}" if expected_type && type != expected_type
+    end
+  end
+end
+```
+
+Screen-specific combinations should live in query objects rather than controllers:
+
+```ruby
+class CompanyTaskQuery
+  def initialize(scope = CompanyTask.all)
+    @scope = scope
+  end
+
+  def for_dashboard
+    self.class.new(@scope.in_progress)
+  end
+
+  def due_before(date)
+    self.class.new(@scope.due_before(date))
+  end
+
+  def relation
+    @scope
+  end
+end
+```
+
+Indexes should match the allow-listed fields that are used frequently in filters or sorts:
+
+```ruby
 add_index :company_tasks,
   "(data->>'status')",
   name: "index_company_tasks_on_json_status"
+
+add_index :company_tasks,
+  "((data->>'due_date')::date)",
+  name: "index_company_tasks_on_json_due_date"
 ```
 
 Expression indexes should be created only for fields that are used frequently in filters or sorts. Date casts require schema validation to prevent malformed date values from breaking queries or index creation.
+
+The codebase should have one rule: raw `data->>` SQL belongs only in `JsonbFilterable`, model scopes, query objects, or migrations. Application workflows should call named scopes and query objects rather than building JSONB SQL directly.
 
 #### Schema versions
 
