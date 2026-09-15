@@ -1,6 +1,6 @@
 # Schema Driven Forms
 
-*Rails and PostgreSQL Design Proposal*
+*Rails, PostgreSQL, and MySQL Design Proposal*
 
 | STATUS<br>Proposed | OWNER<br>To be confirmed | LAST UPDATED<br>15 September 2026 |
 | --- | --- | --- |
@@ -9,13 +9,13 @@
 | --- | --- |
 | Reviewers | Engineering and product reviewers to be confirmed |
 | Related documents | JSON Schema definitions and API contract to be added during implementation |
-| Scope | Schema driven forms for CompanyGoal, CompanyTask, IndividualEmployeeTask, and Employee relationships |
+| Scope | Schema driven forms for CompanyGoal, CompanyTask, IndividualEmployeeTask, and MySQL-backed Employee relationships |
 
 ## 1 Abstract
 
-This proposal recommends a hybrid persistence model for schema driven forms. Each form definition is expressed as JSON Schema and can be stored in a versioned FormDefinition record. User defined, non-relational values are stored in a JSONB data column. Relationships between Account, CompanyGoal, CompanyTask, IndividualEmployeeTask, and Employee use ordinary Rails associations and PostgreSQL foreign keys.
+This proposal recommends a hybrid persistence model for schema driven forms. Each form definition is expressed as JSON Schema and can be stored in a versioned FormDefinition record. User defined, non-relational values are stored in a JSONB data column. Relationships use explicit structural columns and Rails association syntax. Employee remains a MySQL-backed model, so the `employee` association is a Rails-level convenience backed by `employee_id` rather than a PostgreSQL-enforced foreign key.
 
-The frontend continues to render one form from JSON Schema. Relationship fields appear in that schema and in API requests and responses, but Rails removes their values from the JSONB payload before saving. This retains runtime field flexibility while preserving tenant isolation, referential integrity, reverse queries, and familiar Active Record behaviour.
+The frontend continues to render one form from JSON Schema. Relationship fields appear in that schema and in API requests and responses, but Rails removes their values from the JSONB payload before saving. This retains runtime field flexibility while keeping known relationships visible, indexed, and auditable. Same-database relationships can use the strongest available PostgreSQL protections; the MySQL-backed Employee association requires application validation, delete policy, and reconciliation.
 
 ## 2 Goals and Non Goals
 
@@ -33,7 +33,7 @@ Three persistence strategies were considered. The hybrid option is selected beca
 | Approach | Fields | Relationships | Assessment |
 | --- | --- | --- | --- |
 | Fully relational | Typed columns | Foreign keys and join tables | Strong integrity but every field change needs a migration |
-| Hybrid selected | JSONB data | Foreign keys and join tables | Dynamic fields with reliable Rails associations |
+| Hybrid selected | JSONB data | Explicit relationship columns, plus foreign keys where available | Dynamic fields with visible and indexed relationships |
 | Fully document based | JSONB data | IDs inside JSONB | Maximum flexibility but application-owned integrity and query logic |
 
 Storage and representation remain separate. The API may return a single JSON document containing attributes and relationships even though PostgreSQL stores those values in different places.
@@ -50,17 +50,17 @@ Figure 1  Schema driven form request and persistence flow
 Account
   ├── has many CompanyGoals
   ├── has many CompanyTasks through CompanyGoals
-  └── has many Employees
+  └── has many Employees in MySQL
 CompanyGoal
   └── has many CompanyTasks
 CompanyTask
   └── has many IndividualEmployeeTasks
 IndividualEmployeeTask
   ├── belongs to CompanyTask
-  └── belongs to Employee
+  └── belongs to Employee through employee_id
 ```
 
-Each employee belongs to one account. A company task inherits its account through its company goal. An individual employee task connects one company task to one employee and stores employee-specific form values in its own JSONB data document.
+Each employee belongs to one account in MySQL. A company task inherits its account through its company goal in PostgreSQL. An individual employee task connects one company task to one employee through a Rails `employee` association backed by `employee_id`, then validates that employee against MySQL through the account scope. It also stores employee-specific form values in its own JSONB data document.
 
 #### Database records
 
@@ -70,7 +70,7 @@ Each employee belongs to one account. A company task inherits its account throug
 | company_goals | account_id, form_definition_id | All goal fields including title, status, dates, and priority |
 | company_tasks | company_goal_id, form_definition_id | All company task fields |
 | individual_employee_tasks | company_task_id, employee_id, form_definition_id | Employee-specific status, dates, notes, and other fields |
-| employees | account_id | Existing employee storage remains unchanged |
+| employees in MySQL | id, account_id | Existing employee storage remains unchanged |
 
 #### Core components
 
@@ -80,7 +80,8 @@ Each employee belongs to one account. A company task inherits its account throug
 | Frontend form renderer | Renders ordinary fields and custom relationship selectors | Shows validation or option-loading errors without saving |
 | FormSubmissionValidator | Validates the complete request against JSON Schema | Returns field-level 422 errors |
 | SchemaRecordWriter | Separates JSONB values from allowed relationships | Rejects missing or cross-account targets |
-| Active Record and PostgreSQL | Apply model rules, transactions, foreign keys, and indexes | Roll back the write and return a controlled error |
+| Active Record and PostgreSQL | Apply model rules, transactions, local constraints, and indexes | Roll back the PostgreSQL write and return a controlled error |
+| MySQL-backed association checks | Validate Employee through account-scoped MySQL queries | Reject missing, inactive, or cross-account employees before saving |
 
 ## 5 Frontend Schema Contract
 
@@ -121,9 +122,9 @@ A separate UI schema may hold widget names and display options if the chosen fro
 3. The frontend submits one document containing ordinary fields and relationship IDs.
 4. FormSubmissionValidator validates the full document against the selected JSON Schema.
 5. SchemaRecordWriter reads its server-side relationship allow-list and removes recognised relationship fields from the submitted hash.
-6. Each relationship ID is resolved through current_account, such as current_account.company_goals or current_account.employees.
-7. The remaining fields are assigned to record.data and relationship objects are assigned to Active Record associations.
-8. Model validations and PostgreSQL constraints run inside the save transaction.
+6. Each relationship ID is resolved through current_account, such as current_account.company_goals in PostgreSQL or current_account.employees in MySQL.
+7. The remaining fields are assigned to record.data, and relationship objects are assigned through Rails association setters.
+8. Model validations and PostgreSQL constraints run inside the PostgreSQL save transaction. MySQL existence and account checks are application-enforced and must run before persistence.
 9. The serializer reconstructs one JSON response containing attributes and relationships.
 
 #### Create request
@@ -139,7 +140,7 @@ A separate UI schema may hold widget names and display options if the chosen fro
 }
 ```
 
-After the writer runs, company_goal_id is stored in its relational column. The title, status, and due date are stored in company_tasks.data. The new company task receives its own ID only after it is saved.
+After the writer runs, company_goal_id is stored in its explicit relationship column. The title, status, and due date are stored in company_tasks.data. The new company task receives its own ID only after it is saved.
 
 ## 7 Schema Record Writer
 
@@ -203,7 +204,7 @@ class SchemaRecordWriter
 end
 ```
 
-The mapping is an explicit allow-list. It prevents a client from choosing an arbitrary Ruby class. Assigning the relationship object instead of the raw ID also makes the account scope visible in the implementation.
+The mapping is an explicit allow-list. It prevents a client from choosing an arbitrary Ruby class. All mapped relationships use the same association assignment syntax, including the MySQL-backed Employee association. The difference is in the guarantee: PostgreSQL-owned associations can have local database protections, while Employee must be protected by account-scoped Rails validation and operational policy.
 
 ## 8 Controller and Error Contract
 
@@ -265,7 +266,8 @@ Validation failures return HTTP 422. A cross-account ID receives the same respon
 | Backend JSON Schema | The complete submitted document including relationship ID shape | Treats the server as authoritative |
 | SchemaRecordWriter | Relationship existence, account ownership, and assignment eligibility | Enforces tenant and relationship rules |
 | Active Record | Required associations and cross-record business rules | Protects non-controller write paths |
-| PostgreSQL | Not-null constraints, foreign keys, unique indexes, and transaction atomicity | Provides the final integrity boundary |
+| PostgreSQL | Not-null constraints, local indexes, local foreign keys where available, and transaction atomicity | Provides the final integrity boundary for PostgreSQL-owned data |
+| MySQL-backed Employee checks | Employee existence, account ownership, active status, and deletion policy | Protects the cross-database association that PostgreSQL cannot enforce |
 
 The JSON Schema format keyword may be annotation-only depending on validator configuration. Date and date-time formats must therefore be explicitly enabled in the chosen validator or checked by an application validator before persistence.
 
@@ -274,15 +276,27 @@ The JSON Schema format keyword may be annotation-only depending on validator con
 ```ruby
 class IndividualEmployeeTask < ApplicationRecord
   belongs_to :company_task
-  belongs_to :employee
+  belongs_to :employee,
+    class_name: "Employee",
+    foreign_key: :employee_id,
+    primary_key: :id,
+    optional: true
   belongs_to :form_definition
+
+  validates :employee_id, presence: true
   validate :employee_and_task_share_account
+
   private
+
   def employee_and_task_share_account
-    return unless employee && company_task
+    return if employee_id.blank? || company_task.blank?
+
     task_account_id = company_task.company_goal.account_id
-    return if employee.account_id == task_account_id
-    errors.add(:employee, "must belong to the task account")
+    return if Employee.where(
+      id: employee_id,
+      account_id: task_account_id
+    ).exists?
+    errors.add(:employee_id, "is not available for this account")
   end
 end
 ```
@@ -303,11 +317,23 @@ end
 ```
 
 - Resolve goals with current_account.company_goals rather than CompanyGoal.find.
-- Resolve employees with current_account.employees rather than Employee.find.
+- Resolve employees with current_account.employees in MySQL rather than Employee.find.
 - Resolve company tasks with current_account.company_tasks through company goals.
 - Never call constantize on a model type supplied by the client.
 - Authorise the chosen FormDefinition when definitions can vary by account.
 - Avoid logging sensitive JSONB values unless the logging policy explicitly permits them.
+
+#### MySQL-backed Employee association
+
+Employee can use Rails association syntax, but it is still a cross-database association. PostgreSQL cannot enforce that `individual_employee_tasks.employee_id` exists in MySQL, cannot cascade deletes from MySQL, and cannot join directly to the employee table for reporting.
+
+The application should therefore treat Employee as an association with weaker database guarantees:
+
+- Validate employee existence and account ownership before saving.
+- Index `individual_employee_tasks.employee_id` in PostgreSQL for local filtering.
+- Avoid hard-deleting employees in MySQL while PostgreSQL records may reference them.
+- Add a deletion guard, soft delete policy, or reconciliation job for stale employee IDs.
+- Keep Employee references out of JSONB unless the relationship itself truly needs to become user-configurable.
 
 ## 11 Consistency Querying and Versioning
 
@@ -315,7 +341,7 @@ end
 
 A complete form submission replaces record.data. A partial update must merge submitted non-relational values into the existing document or validate a reconstructed complete document. The API should distinguish PUT-style replacement from PATCH-style merge rather than relying on implicit behaviour.
 
-The JSONB data and relational assignments should be saved in one database transaction. A foreign-key or model-validation failure then leaves neither part partially updated.
+The JSONB data and PostgreSQL relationship assignments should be saved in one PostgreSQL transaction. A local constraint or model-validation failure then leaves neither part partially updated. MySQL-backed Employee association checks are not protected by a PostgreSQL foreign key, so the application must validate them before save and periodically reconcile them after MySQL employee changes.
 
 #### Filtering and indexes
 
@@ -341,7 +367,7 @@ A saved record should retain its form_definition_id when the exact schema versio
 | Alternative | Reason considered | Reason not selected |
 | --- | --- | --- |
 | All fields and relationships in columns | Native Rails behaviour and strongest SQL ergonomics | Conflicts with runtime-configurable fields and requires frequent migrations |
-| All fields and relationship IDs in JSONB | One self-contained document and no relationship migrations | No ordinary foreign keys, harder reverse queries, and custom integrity logic |
+| All fields and relationship IDs in JSONB | One self-contained document and no relationship migrations | Hides important references inside JSONB, makes reverse queries harder, and requires custom integrity logic |
 | Duplicate relationship IDs in columns and JSONB | Raw JSONB appears self-contained | Creates two sources of truth and permanent synchronisation risk |
 | Generic polymorphic relationship table | Supports administrator-defined relationships | Adds complexity that is unnecessary while relationship types remain known |
 
@@ -355,11 +381,11 @@ A saved record should retain its form_definition_id when the exact schema versio
 
 ## 14 Decision and Next Steps
 
-Proceed with the hybrid design. Store non-relational form values in JSONB, store known relationships as foreign keys, describe relationship controls in the frontend schema, and reconstruct a unified JSON document at the API boundary. Treat PostgreSQL relationships and the JSONB data document as separate authoritative stores for their respective concerns.
+Proceed with the hybrid design. Store non-relational form values in JSONB, store known relationships as explicit structural columns, describe relationship controls in the frontend schema, and reconstruct a unified JSON document at the API boundary. Use Rails association syntax for both PostgreSQL-owned relationships and the MySQL-backed Employee relationship. Use PostgreSQL constraints for PostgreSQL-owned relationships where available, and treat Employee as a cross-database association that requires application validation, deletion policy, and reconciliation.
 
 | Milestone | Deliverable | Exit criteria |
 | --- | --- | --- |
-| M1 | Models, migrations, account associations, and one CompanyTask schema | A task saves JSONB fields and an account-scoped goal relationship |
-| M2 | FormSubmissionValidator, SchemaRecordWriter, controllers, and error contract | Automated tests cover valid, invalid, missing, and cross-account relationships |
+| M1 | Models, migrations, account associations, external Employee reference handling, and one CompanyTask schema | A task saves JSONB fields and an account-scoped goal relationship |
+| M2 | FormSubmissionValidator, SchemaRecordWriter, controllers, and error contract | Automated tests cover valid, invalid, missing, cross-account, and stale Employee references |
 | M3 | Frontend relationship widget and scoped options endpoints | The form renders, submits, and displays field-level errors end to end |
 | M4 | Index review, schema version policy, audit logging, and rollout | Query plans are acceptable and schema changes are recoverable |
